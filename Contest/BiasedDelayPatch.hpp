@@ -13,9 +13,11 @@
 //  - B: feedback
 //  - C: bias: low..high
 //  - D: dry/wet mix
+//  - Push-button:
 //
 //  TODO:
-//  - see SimpleDelayPatch.hpp
+//  - don't just clip extreme values, instead add a simple limiter
+//  - "horizontal sigmoid"-style parameter interpolation for bias control, atm it's a ramped step function with a sharp slope change in the centre
 //
 
 /*
@@ -50,71 +52,78 @@ class BiasedDelayPatch : public Patch {
   const float MED_BIAS;
   const float MAX_BIAS;
 
-  AudioBuffer* delayBuffer;
-  unsigned int delayBufIdx;
-  unsigned int oldDelayInSamples;
+  float* circularBuffer;
+  unsigned int bufferSize;
+  unsigned int writeIdx;
   
 public:
-  BiasedDelayPatch() : MIN_DELAY(0.01), MAX_DELAY(2), MIN_BIAS(0.8), MED_BIAS(1), 
-    MAX_BIAS(1.5), delayBuffer(NULL), delayBufIdx(0) {
+  BiasedDelayPatch() : MIN_DELAY(0.01), MAX_DELAY(4), MIN_BIAS(0.5), MED_BIAS(1), MAX_BIAS(3), ramp(0.1), circularBuffer(NULL) {
     registerParameter(PARAMETER_A, "Delay");
     registerParameter(PARAMETER_B, "Feedback");
     registerParameter(PARAMETER_C, "Bias");
     registerParameter(PARAMETER_D, "Dry/Wet");
+    memset(oldVal, 0, sizeof(oldVal));
 
-    delayBuffer = createMemoryBuffer(2, MAX_DELAY * getSampleRate());
+    AudioBuffer* buffer = createMemoryBuffer(1, MAX_DELAY * getSampleRate());
+    bufferSize = buffer->getSize();    
+    circularBuffer = buffer->getSamples(0);
   }
 
-  void processAudio(AudioBuffer &buffer){
+//     if (circularBuffer==NULL)
+//     {
+//       bufferSize = MAX_DELAY * rate;
+//       circularBuffer = new float[bufferSize];
+//       memset(circularBuffer, 0, bufferSize*sizeof(float));
+//       writeIdx = 0;
+//     }
 
-    unsigned int delayInSamples = getDelayInSamples(PARAMETER_A);
-    float feedback = getParameterValue(PARAMETER_B);
-    float bias = getBiasExponent(PARAMETER_C);
-    float dryWetMix = getParameterValue(PARAMETER_D);
+    void processAudio(AudioBuffer &buffer){
+
+    double rate = getSampleRate();
     
-    int bufSize = buffer.getSize();
-    int delayBufSize = delayBuffer->getSize();
 
-    for (int ch = 0; ch<buffer.getChannels(); ++ch)
-    {
-      float* buf = buffer.getSamples(ch);
-      float* delayBuf = delayBuffer->getSamples(ch);
-
-      unsigned int writeIdx = delayBufIdx;
-      int readIdx = delayBufIdx - delayInSamples;
-      while (readIdx<0) readIdx += delayBufSize;
-      int oldReadIdx = delayBufIdx - oldDelayInSamples;
-      while (oldReadIdx<0) oldReadIdx += delayBufSize;
-
-      for (int i=0; i<bufSize; ++i)
-      {
-        float delaySample = linearBlend(delayBuf[oldReadIdx], delayBuf[readIdx], (float)i/bufSize);
-        float v = buf[i] + delaySample * feedback;
-        v = applyBias(v, bias);
-        delayBuf[writeIdx] = min(1, max(-1, v)); // Guard: hard range limits.
-        buf[i] = linearBlend(buf[i], delaySample, dryWetMix);
+    unsigned int sampleDelay = getSampleDelay(getRampedParameterValue(PARAMETER_A), rate);
+    sampleDelay = min(sampleDelay, bufferSize);
+    float feedback = getRampedParameterValue(PARAMETER_B);
+    float bias = getBiasExponent(1 - getRampedParameterValue(PARAMETER_C));
+    float dryWetMix = getRampedParameterValue(PARAMETER_D);
     
-        writeIdx = (++writeIdx) % delayBufSize;
-        readIdx = (++readIdx) % delayBufSize;
-      }
-    }
-    delayBufIdx = (delayBufIdx + bufSize) % delayBufSize;
-    oldDelayInSamples = delayInSamples;
+
+    int size = buffer.getSize();
+
+ 	for(int ch = 0; ch<buffer.getChannels(); ++ch)
+ 	{
+	    float* buf = buffer.getSamples(ch);
+
+	    for (int i=0; i<size; ++i)
+	    {
+	      float delaySample = circularBuffer[writeIdx];
+	      float v = buf[i] + circularBuffer[writeIdx] * feedback;
+	      v = applyBias(v, bias);
+	      circularBuffer[writeIdx] = min(1, max(-1, v)); // Guard: hard range limits.
+	      buf[i] = linearBlend(buf[i], delaySample, dryWetMix);
+
+	      writeIdx = (++writeIdx) % sampleDelay;
+	    }
+		
+  	}
+  }
+  
+  ~BiasedDelayPatch(){
+    delete(circularBuffer);
   }
   
 private:
   
-  unsigned int getDelayInSamples(PatchParameterId id){
-    unsigned int minDelayInSamples = getSampleRate() * MIN_DELAY;
-    return minDelayInSamples + getParameterValue(id) * (delayBuffer->getSize() - minDelayInSamples);
+  unsigned int getSampleDelay(float p1, float rate){
+    return (MIN_DELAY + p1 * (MAX_DELAY-MIN_DELAY)) * rate;
   }
-  
+
   // Mapping p1 parameter ranges so that:
   // - full-left (0) is "low bias"
   // - centre (0.5) is "no bias"
   // - full-right (1.0) is "high bias"
-  float getBiasExponent(PatchParameterId id){
-    float p1 = 1 - getParameterValue(id);
+  float getBiasExponent(float p1){
     if (p1 < 0.5)
     { // min .. med
       p1 = p1 * 2; // [0..1] range
@@ -135,6 +144,18 @@ private:
   // Fade from a to b, over mix range [0..1]
   float linearBlend(float a, float b, float mix){
     return a * (1 - mix) + b * mix;
+  }
+
+  // Parameter ramping to reduce clicks.
+  
+  float oldVal[4];
+  float ramp; // 0..1
+  
+  float getRampedParameterValue(PatchParameterId id){
+    float val = getParameterValue(id);
+    float result = val * ramp + oldVal[id] * (1-ramp);
+    oldVal[id] = val;
+    return result;
   }
 };
 
